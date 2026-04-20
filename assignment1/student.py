@@ -32,11 +32,10 @@ def mod_sub(a, b, q):
     return (a - b) % q
 
 
-def mod_mul(T, q, q_inv):
+def mod_mul(a, b, q):
     """Return (a * b) mod q, elementwise."""
-    m = (T * q_inv) & 0xFFFFFFFF
-    t = (T + m * q) >> 32
-    return jnp.where(t >= q, t - q, t).astype(jnp.uint32)
+    #ai notes montgomery reduction
+    return (a * b) % q
 
 
 # -----------------------------------------------------------------------------
@@ -51,7 +50,7 @@ def ntt(x, *, q, psi_powers, twiddles):
 
     Args:
         x: Input coefficients, shape (batch, N), values in [0, q)
-        q: Prime modulus satisfying (q - 1) % 2N == 0 or 2147483497
+        q: Prime modulus satisfying (q - 1) % 2N == 0
         psi_powers: Precomputed ψ^n table
         twiddles: Precomputed twiddle table
 
@@ -61,24 +60,20 @@ def ntt(x, *, q, psi_powers, twiddles):
     batch_size, N = x.shape
     k_idx = jnp.arange(N)
     n_idx = jnp.arange(N)
-    q_inv = pow(-q, -1, 2**32)
-    x_mont = (x.astype(jnp.uint64) * ((2**32) % q)) % q
-
-    exponents = (2 * k_idx[:, None] + 1) * n_idx[None, :]
+    
+    exponents = (2 * k_idx[:, None] + 1).astype(jnp.int64) * n_idx[None, :].astype(jnp.int64)
     index = exponents % (2 * N)
-    lookup_idx = (index % N)
+    lookup_idx = (index % N).astype(jnp.int32)
     is_negative = index >= N
     
     base_values = psi_powers[lookup_idx]
-
     kernel = jnp.where(is_negative, (q - base_values) % q, base_values)
-    def safe_dot_product(vector_x, kernel_row):
-        products = mod_mul(vector_x.astype(jnp.int64) * kernel_row.astype(jnp.int64), q, q_inv)
-        sum = jnp.sum(products.astype(jnp.int64)) % q
-        return mod_mul(sum.astype(jnp.uint64), q, q_inv)
+    '''def safe_dot_product(vector_x, kernel_row):
+        products = (vector_x.astype(jnp.int64) * kernel_row.astype(jnp.int64)) % q
+        return jnp.sum(products) % q
     vectorized_ntt = jax.vmap(lambda p: jax.vmap(lambda k_row: safe_dot_product(p, k_row))(kernel))
-    y = vectorized_ntt(x_mont)
-
+    y = vectorized_ntt(x)'''
+    y = jnp.matmul(x,kernel.T) % q
     return y.astype(jnp.uint32)
 
 def prepare_tables(*, q, psi_powers, twiddles):
@@ -91,9 +86,6 @@ def prepare_tables(*, q, psi_powers, twiddles):
     This function runs before timing, so its cost is not counted as latency.
     Must return (psi_powers, twiddles) in the form expected by `ntt`.
     """
-    R = 2**32
-    R_mod_q = R % q
-    psi_powers_mmm = (psi_powers.astype(jnp.uint64) * R_mod_q) % q
 
-    return psi_powers_mmm.astype(jnp.uint32), twiddles
+    return psi_powers, twiddles
 
