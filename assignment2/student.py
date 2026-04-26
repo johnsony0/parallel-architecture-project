@@ -9,6 +9,7 @@ Only 32-bit kernels are compulsory in the base track.
 from __future__ import annotations
 
 import jax
+import jax.numpy as jnp
 jax.config.update("jax_enable_x64", True)
 
 
@@ -18,43 +19,17 @@ jax.config.update("jax_enable_x64", True)
 
 def mod_add_32(a, b, q):
     """Return (a + b) mod q for the 32-bit track."""
-    if (a >= q - b):
-        return a - (q - b)
-    return a + b
+    return ((jnp.uint64(a) + jnp.uint64(b)) % jnp.uint64(q)).astype(jnp.uint32)
 
 
 def mod_sub_32(a, b, q):
     """Return (a - b) mod q for the 32-bit track."""
-    if a < b:
-        return (q - b) + a
-    else:
-        return a - b
+    return ((jnp.uint64(q) + jnp.uint64(a) - jnp.uint64(b)) % jnp.uint64(q)).astype(jnp.uint32)
 
 
 def mod_mul_32(a, b, q):
-    print(a,b,q)
     """Return (a * b) mod q for the 32-bit track."""
-    a_hi, a_lo = a >> 16, a & 0xFFFF
-    b_hi, b_lo = b >> 16, b & 0xFFFF
-
-    def shift_mod(val, shift, q):
-        for _ in range(shift):
-            val = (val << 1)
-            if val >= q: val -= q
-        return val
-
-    term1 = (a_hi * b_hi) % q
-    term1 = shift_mod(term1, 32, q) 
-
-    mid_term = (a_hi * b_lo + a_lo * b_hi) % q
-    term2 = shift_mod(mid_term, 16, q) 
-
-    term3 = (a_lo * b_lo) % q
-
-    res = mod_add_32(term1, term2, q)
-    res = mod_add_32(res, term3, q)
-    
-    return res
+    return ((jnp.uint64(a) * jnp.uint64(b)) % jnp.uint64(q)).astype(jnp.uint32)
 
 
 # -----------------------------------------------------------------------------
@@ -64,23 +39,18 @@ def mod_mul_32(a, b, q):
 def mod_add_64(a, b, q):
     """Optional 64-bit modular add kernel."""
     # TODO(student): implement when enabling 64-bit track.
-    if (a+b >= q):
-        return a+b-q
-    return (a + b)
+    raise NotImplementedError
 
 
 def mod_sub_64(a, b, q):
     """Optional 64-bit modular subtract kernel."""
-    res = a - b
-    if res < 0:
-        return res + q
-    return res
+    raise NotImplementedError
 
 
 def mod_mul_64(a, b, q):
     """Optional 64-bit modular multiply kernel."""
     # TODO(student): implement when enabling 64-bit track.
-    return a*b%q
+    raise NotImplementedError
 
 
 # -----------------------------------------------------------------------------
@@ -90,23 +60,18 @@ def mod_mul_64(a, b, q):
 def mod_add_128(a, b, q):
     """Optional 128-bit modular add kernel."""
     # TODO(student): implement when enabling 128-bit track.
-    if (a+b >= q):
-        return a+b-q
-    return (a + b)
+    raise NotImplementedError
 
 
 def mod_sub_128(a, b, q):
     """Optional 128-bit modular subtract kernel."""
-    res = a - b
-    if res < 0:
-        return res + q
-    return res
+    raise NotImplementedError
 
 
 def mod_mul_128(a, b, q):
     """Optional 128-bit modular multiply kernel."""
     # TODO(student): implement when enabling 128-bit track.
-    return a*b%q
+    raise NotImplementedError
 
 
 # -----------------------------------------------------------------------------
@@ -145,7 +110,9 @@ def mod_mul(a, b, q, *, bit_width=32):
 
 def mle_update_32(zero_eval, one_eval, target_eval, *, q):
     """Compulsory 32-bit MLE update."""
-    raise NotImplementedError
+    diff = mod_sub(one_eval, zero_eval, q)
+    prod = mod_mul(diff, target_eval, q)
+    return mod_add(prod, zero_eval, q)
 
 
 def mle_update_64(zero_eval, one_eval, target_eval, *, q):
@@ -168,11 +135,89 @@ def mle_update(zero_eval, one_eval, target_eval, *, q, bit_width=32):
     if int(bit_width) == 128:
         return mle_update_128(zero_eval, one_eval, target_eval, q=q)
     raise ValueError(f"Unsupported bit_width={bit_width}")
+    
+from functools import partial
 
+def compute_composition_indexed(expr_indices, extensions, q):
+    """
+    Computes composition using indices instead of names.
+    Inlined into JIT kernels; expr_indices must be a static tuple of tuples.
+    """
+    total_sum = jnp.zeros_like(extensions[0], dtype=jnp.uint32)
+    for term_indices in expr_indices:
+        product = jnp.ones_like(extensions[0], dtype=jnp.uint32)
+        for var_idx in term_indices:
+            val = extensions[var_idx]
+            product = mod_mul_32(product, val, q)
+        total_sum = mod_add_32(total_sum, product, q)
+    return total_sum
+
+@partial(jax.jit, static_argnums=(3,))
+def compute_round_points_kernel(tables_tuple, x_points, q, expr_indices):
+    """
+    JIT-optimized kernel to compute all points for a round polynomial.
+    """
+    def eval_at_x(x):
+        extensions = []
+        for table in tables_tuple:
+            evens = table[0::2]
+            odds = table[1::2]
+            extensions.append(mle_update_32(evens, odds, x, q=q))
+        
+        pair_compositions = compute_composition_indexed(expr_indices, extensions, q)
+        return (jnp.sum(pair_compositions.astype(jnp.uint64)) % jnp.uint64(q)).astype(jnp.uint32)
+
+    return jax.vmap(eval_at_x)(x_points)
+
+@jax.jit
+def fold_tables_kernel(tables_tuple, challenge, q):
+    """Vectorized folding of all tables for the next round."""
+    new_tables = []
+    for table in tables_tuple:
+        evens = table[0::2]
+        odds = table[1::2]
+        new_tables.append(mle_update_32(evens, odds, challenge, q=q))
+    return tuple(new_tables)
 
 def sumcheck_32(eval_tables, *, q, expression, challenges, num_rounds):
-    """Compulsory 32-bit sumcheck path."""
-    raise NotImplementedError
+    """
+    GPU-optimized 32-bit sumcheck using JAX.
+    """
+    degree = max(len(term) for term in expression)
+    q = jnp.asarray(q, dtype=jnp.uint32)
+    challenges = jnp.asarray(challenges, dtype=jnp.uint32)
+    x_points = jnp.arange(degree + 1, dtype=jnp.uint32)
+    
+    # 1. Pre-index the expression for JIT compatibility
+    standard_names = ("a", "b", "c", "d", "e", "g")
+    active_names = [n for n in standard_names if n in eval_tables]
+    # Fallback for any unexpected names not in standard list
+    for n in eval_tables:
+        if n not in active_names:
+            active_names.append(n)
+            
+    name_to_idx = {name: i for i, name in enumerate(active_names)}
+    expr_indices = tuple(tuple(name_to_idx[var] for var in term) for term in expression)
+    
+    # 2. Prepare initial tables as a tuple of JAX arrays
+    current_tables = tuple(jnp.asarray(eval_tables[name], dtype=jnp.uint32) for name in active_names)
+    
+    all_round_evals = []
+
+    for r in range(num_rounds):
+        # 3. Compute all points for this round's univariate polynomial in one kernel call
+        round_poly = compute_round_points_kernel(current_tables, x_points, q, expr_indices)
+        all_round_evals.append(round_poly)
+
+        # 4. Fold tables for the next round (except the last round)
+        if r < num_rounds - 1:
+            current_tables = fold_tables_kernel(current_tables, challenges[r], q)
+
+    # Round 0 evaluations give the initial sum: g_1(0) + g_1(1)
+    claim0 = mod_add_32(all_round_evals[0][0], all_round_evals[0][1], q)
+
+    return jnp.asarray(claim0, dtype=jnp.uint32), jnp.stack(all_round_evals)
+
 
 
 def sumcheck_64(eval_tables, *, q, expression, challenges, num_rounds):
