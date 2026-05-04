@@ -36,62 +36,53 @@ def mod_mul_32(a, b, q):
     return ((jnp.uint64(a) * jnp.uint64(b)) % jnp.uint64(q)).astype(jnp.uint32)
 
 
+def get_mont_params_32(q):
+    """Compute Montgomery parameters for 32-bit modulus."""
+    q = jnp.uint32(q)
+    # Newton's method for modular inverse modulo 2^32
+    q_prime = jnp.uint32(1)
+    for _ in range(5):
+        q_prime = q_prime * (jnp.uint32(2) - q * q_prime)
+    q_prime = -q_prime
+    
+    # R = 2^32. R_mod_q = 2^32 % q = (2^32 - q) % q = -q % q
+    R_mod_q = jnp.uint32((jnp.uint64(1) << 32) % jnp.uint64(q))
+    R2_mod_q = jnp.uint32((jnp.uint64(R_mod_q) * jnp.uint64(R_mod_q)) % jnp.uint64(q))
+    return q_prime, R_mod_q, R2_mod_q
+
+
+def redc_32(T, q, q_prime):
+    """Montgomery reduction: returns T * R^-1 mod q."""
+    m = jnp.uint32(T) * q_prime
+    t = (T >> 32) + ((jnp.uint64(jnp.uint32(T)) + jnp.uint64(m) * jnp.uint64(q)) >> 32)
+    return jnp.where(t >= q, jnp.uint32(t - q), jnp.uint32(t))
+
+
+def mont_mul_32(a_bar, b_bar, q, q_prime):
+    """Montgomery multiplication: returns (a_bar * b_bar * R^-1) mod q."""
+    T = jnp.uint64(a_bar) * jnp.uint64(b_bar)
+    return redc_32(T, q, q_prime)
+
+
 # -----------------------------------------------------------------------------
 # 64-bit primitives (optional, left for future implementation)
 # -----------------------------------------------------------------------------
 
 def mod_add_64(a, b, q):
     """Optional 64-bit modular add kernel."""
-    res_plus = a + b
-    res_minus = a - (q - b)
-    return jnp.where(a >= q - b, res_minus, res_plus)
+    # TODO(student): implement when enabling 64-bit track.
+    raise NotImplementedError
 
 
 def mod_sub_64(a, b, q):
     """Optional 64-bit modular subtract kernel."""
-    res_minus = a - b
-    res_plus = (q - b) + a
-    return jnp.where(a < b, res_plus, res_minus)
+    raise NotImplementedError
 
 
 def mod_mul_64(a, b, q):
-    """64-bit modular multiply kernel using bit-by-bit approach."""
-    a = jnp.uint64(a)
-    b = jnp.uint64(b)
-    q = jnp.uint64(q)
-
-    # Initialize carry with the broadcasted shape of a and b to support vectorized ops.
-    init_carry = jnp.zeros_like(a * b)
-
-    def body_fun(i, carry):
-        res = mod_add_64(carry, carry, q)
-        bit = (a >> (63 - i)) & jnp.uint64(1)
-        term = jnp.where(bit, b, jnp.uint64(0))
-        return mod_add_64(res, term, q)
-
-    return jax.lax.fori_loop(0, 64, body_fun, init_carry)
-
-
-def mod_sum_64(arr, q):
-    """Modular sum of an array using 64-bit add."""
-
-    def body(carry, x):
-        return mod_add_64(carry, x, q), None
-
-    res, _ = jax.lax.scan(body, jnp.uint64(0), arr)
-    return res
-
-
-def compute_composition_indexed_64(expr_indices, extensions, q):
-    """Computes composition for 64-bit track."""
-    total_sum = jnp.zeros_like(extensions[0], dtype=jnp.uint64)
-    for term_indices in expr_indices:
-        product = jnp.ones_like(extensions[0], dtype=jnp.uint64)
-        for var_idx in term_indices:
-            val = extensions[var_idx]
-            product = mod_mul_64(product, val, q)
-        total_sum = mod_add_64(total_sum, product, q)
-    return total_sum
+    """Optional 64-bit modular multiply kernel."""
+    # TODO(student): implement when enabling 64-bit track.
+    raise NotImplementedError
 
 
 # -----------------------------------------------------------------------------
@@ -159,9 +150,7 @@ def mle_update_32(zero_eval, one_eval, target_eval, *, q):
 def mle_update_64(zero_eval, one_eval, target_eval, *, q):
     """Optional 64-bit MLE update."""
     # TODO(student): implement when enabling 64-bit track.
-    diff = mod_sub(one_eval, zero_eval, q, bit_width=64)
-    prod = mod_mul(diff, target_eval, q, bit_width=64)
-    return mod_add(prod, zero_eval, q, bit_width=64)
+    raise NotImplementedError
 
 
 def mle_update_128(zero_eval, one_eval, target_eval, *, q):
@@ -181,60 +170,74 @@ def mle_update(zero_eval, one_eval, target_eval, *, q, bit_width=32):
     
 from functools import partial
 
-def compute_composition_indexed(expr_indices, extensions, q):
-    """
-    Computes composition using indices instead of names.
-    Inlined into JIT kernels; expr_indices must be a static tuple of tuples.
-    """
-    total_sum = jnp.zeros_like(extensions[0], dtype=jnp.uint32)
+def mle_update_32_mont(zero_eval_bar, one_eval_bar, target_eval_bar, q, q_prime):
+    """MLE update in Montgomery form."""
+    diff_bar = mod_sub_32(one_eval_bar, zero_eval_bar, q)
+    prod_bar = mont_mul_32(diff_bar, target_eval_bar, q, q_prime)
+    return mod_add_32(prod_bar, zero_eval_bar, q)
+
+
+def compute_composition_indexed_mont(expr_indices, extensions_bar, q, q_prime, R_mod_q):
+    """Computes composition in Montgomery form."""
+    total_sum_bar = jnp.zeros_like(extensions_bar[0], dtype=jnp.uint32)
     for term_indices in expr_indices:
-        product = jnp.ones_like(extensions[0], dtype=jnp.uint32)
+        # Start with 1 in Montgomery form, which is R mod q
+        product_bar = jnp.full_like(extensions_bar[0], R_mod_q, dtype=jnp.uint32)
         for var_idx in term_indices:
-            val = extensions[var_idx]
-            product = mod_mul_32(product, val, q)
-        total_sum = mod_add_32(total_sum, product, q)
-    return total_sum
+            val_bar = extensions_bar[var_idx]
+            product_bar = mont_mul_32(product_bar, val_bar, q, q_prime)
+        total_sum_bar = mod_add_32(total_sum_bar, product_bar, q)
+    return total_sum_bar
 
-@partial(jax.jit, static_argnums=(3,))
-def compute_round_points_kernel(tables_tuple, x_points, q, expr_indices):
-    """
-    JIT-optimized kernel to compute all points for a round polynomial.
-    """
-    def eval_at_x(x):
-        extensions = []
-        for table in tables_tuple:
-            evens = table[0::2]
-            odds = table[1::2]
-            extensions.append(mle_update_32(evens, odds, x, q=q))
+@partial(jax.jit, static_argnums=(4,))
+def compute_round_points_kernel_mont(tables_tuple_bar, x_points_bar, q, q_prime, expr_indices, R_mod_q):
+    """JIT-optimized kernel using Montgomery reduction."""
+    def eval_at_x(x_bar):
+        extensions_bar = []
+        for table_bar in tables_tuple_bar:
+            evens_bar = table_bar[0::2]
+            odds_bar = table_bar[1::2]
+            extensions_bar.append(mle_update_32_mont(evens_bar, odds_bar, x_bar, q, q_prime))
         
-        pair_compositions = compute_composition_indexed(expr_indices, extensions, q)
-        return (jnp.sum(pair_compositions.astype(jnp.uint64)) % jnp.uint64(q)).astype(jnp.uint32)
+        comp_bar = compute_composition_indexed_mont(expr_indices, extensions_bar, q, q_prime, R_mod_q)
+        # Sum is still in Montgomery form
+        sum_bar = (jnp.sum(comp_bar.astype(jnp.uint64)) % jnp.uint64(q)).astype(jnp.uint32)
+        # Convert back from Montgomery form: redc(sum_bar) = sum_bar * R^-1 mod q
+        return redc_32(jnp.uint64(sum_bar), q, q_prime)
 
-    return jax.vmap(eval_at_x)(x_points)
+    return jax.vmap(eval_at_x)(x_points_bar)
+
 
 @jax.jit
-def fold_tables_kernel(tables_tuple, challenge, q):
-    """Vectorized folding of all tables for the next round."""
-    new_tables = []
-    for table in tables_tuple:
-        evens = table[0::2]
-        odds = table[1::2]
-        new_tables.append(mle_update_32(evens, odds, challenge, q=q))
-    return tuple(new_tables)
+def fold_tables_kernel_mont(tables_tuple_bar, challenge_bar, q, q_prime):
+    """Vectorized folding in Montgomery form."""
+    new_tables_bar = []
+    for table_bar in tables_tuple_bar:
+        evens_bar = table_bar[0::2]
+        odds_bar = table_bar[1::2]
+        new_tables_bar.append(mle_update_32_mont(evens_bar, odds_bar, challenge_bar, q, q_prime))
+    return tuple(new_tables_bar)
+
 
 def sumcheck_32(eval_tables, *, q, expression, challenges, num_rounds):
     """
-    GPU-optimized 32-bit sumcheck using JAX.
+    GPU-optimized 32-bit sumcheck using Montgomery reduction.
     """
     degree = max(len(term) for term in expression)
     q = jnp.asarray(q, dtype=jnp.uint32)
     challenges = jnp.asarray(challenges, dtype=jnp.uint32)
     x_points = jnp.arange(degree + 1, dtype=jnp.uint32)
     
+    # Montgomery setup
+    q_prime, R_mod_q, R2_mod_q = get_mont_params_32(q)
+    
+    # Helper to convert to Montgomery form: (x * R) mod q = redc(x * R^2)
+    def to_mont(x):
+        return mont_mul_32(x, R2_mod_q, q, q_prime)
+
     # 1. Pre-index the expression for JIT compatibility
     standard_names = ("a", "b", "c", "d", "e", "g")
     active_names = [n for n in standard_names if n in eval_tables]
-    # Fallback for any unexpected names not in standard list
     for n in eval_tables:
         if n not in active_names:
             active_names.append(n)
@@ -242,19 +245,23 @@ def sumcheck_32(eval_tables, *, q, expression, challenges, num_rounds):
     name_to_idx = {name: i for i, name in enumerate(active_names)}
     expr_indices = tuple(tuple(name_to_idx[var] for var in term) for term in expression)
     
-    # 2. Prepare initial tables as a tuple of JAX arrays
-    current_tables = tuple(jnp.asarray(eval_tables[name], dtype=jnp.uint32) for name in active_names)
+    # 2. Prepare initial tables in Montgomery form
+    current_tables_bar = tuple(to_mont(jnp.asarray(eval_tables[name], dtype=jnp.uint32)) for name in active_names)
+    challenges_bar = to_mont(challenges)
+    x_points_bar = to_mont(x_points)
     
     all_round_evals = []
 
     for r in range(num_rounds):
-        # 3. Compute all points for this round's univariate polynomial in one kernel call
-        round_poly = compute_round_points_kernel(current_tables, x_points, q, expr_indices)
+        # 3. Compute all points for this round's univariate polynomial
+        round_poly = compute_round_points_kernel_mont(
+            current_tables_bar, x_points_bar, q, q_prime, expr_indices, R_mod_q
+        )
         all_round_evals.append(round_poly)
 
-        # 4. Fold tables for the next round (except the last round)
+        # 4. Fold tables for the next round
         if r < num_rounds - 1:
-            current_tables = fold_tables_kernel(current_tables, challenges[r], q)
+            current_tables_bar = fold_tables_kernel_mont(current_tables_bar, challenges_bar[r], q, q_prime)
 
     # Round 0 evaluations give the initial sum: g_1(0) + g_1(1)
     claim0 = mod_add_32(all_round_evals[0][0], all_round_evals[0][1], q)
@@ -263,88 +270,10 @@ def sumcheck_32(eval_tables, *, q, expression, challenges, num_rounds):
 
 
 
-@partial(jax.jit, static_argnums=(3,))
-def compute_round_points_kernel_64(tables_tuple, x_points, q, expr_indices):
-    """
-    JIT-optimized 64-bit kernel using sequential additions for MLE updates.
-    """
-    exts_0 = [t[0::2] for t in tables_tuple]
-    exts_1 = [t[1::2] for t in tables_tuple]
-    diffs = [mod_sub_64(o, e, q) for e, o in zip(exts_0, exts_1)]
-    
-    degree = len(x_points) - 1
-    round_poly = []
-
-    # x = 0
-    current_exts = exts_0
-    comp = compute_composition_indexed_64(expr_indices, current_exts, q)
-    sum_val = mod_sum_64(comp, q)
-    round_poly.append(sum_val)
-
-    # x = 1
-    current_exts = exts_1
-    comp = compute_composition_indexed_64(expr_indices, current_exts, q)
-    sum_val = mod_sum_64(comp, q)
-    round_poly.append(sum_val)
-
-    # x = 2 ... degree
-    for i in range(2, degree + 1):
-        current_exts = [mod_add_64(cur, d, q) for cur, d in zip(current_exts, diffs)]
-        comp = compute_composition_indexed_64(expr_indices, current_exts, q)
-        sum_val = mod_sum_64(comp, q)
-        round_poly.append(sum_val)
-
-    return jnp.stack(round_poly)
-
-
-@jax.jit
-def fold_tables_kernel_64(tables_tuple, challenge, q):
-    """Vectorized folding for 64-bit tables."""
-    new_tables = []
-    for table in tables_tuple:
-        evens = table[0::2]
-        odds = table[1::2]
-        new_tables.append(mle_update_64(evens, odds, challenge, q=q))
-    return tuple(new_tables)
-
-
 def sumcheck_64(eval_tables, *, q, expression, challenges, num_rounds):
-    """
-    GPU-optimized 64-bit sumcheck using JAX and sequential evaluation.
-    """
-    degree = max(len(term) for term in expression)
-    q = jnp.asarray(q, dtype=jnp.uint64)
-    challenges = jnp.asarray(challenges, dtype=jnp.uint64)
-    x_points = jnp.arange(degree + 1, dtype=jnp.uint64)
-    
-    # 1. Pre-index the expression
-    standard_names = ("a", "b", "c", "d", "e", "g")
-    active_names = [n for n in standard_names if n in eval_tables]
-    for n in eval_tables:
-        if n not in active_names:
-            active_names.append(n)
-            
-    name_to_idx = {name: i for i, name in enumerate(active_names)}
-    expr_indices = tuple(tuple(name_to_idx[var] for var in term) for term in expression)
-    
-    # 2. Prepare initial tables
-    current_tables = tuple(jnp.asarray(eval_tables[name], dtype=jnp.uint64) for name in active_names)
-    
-    all_round_evals = []
-
-    for r in range(num_rounds):
-        # 3. Compute all points for this round's univariate polynomial
-        round_poly = compute_round_points_kernel_64(current_tables, x_points, q, expr_indices)
-        all_round_evals.append(round_poly)
-
-        # 4. Fold tables for the next round
-        if r < num_rounds - 1:
-            current_tables = fold_tables_kernel_64(current_tables, challenges[r], q)
-
-    # Round 0 evaluations give the initial sum: g_1(0) + g_1(1)
-    claim0 = mod_add_64(all_round_evals[0][0], all_round_evals[0][1], q)
-
-    return jnp.asarray(claim0, dtype=jnp.uint64), jnp.stack(all_round_evals)
+    """Optional 64-bit sumcheck path."""
+    # TODO(student): implement when enabling 64-bit track.
+    raise NotImplementedError
 
 
 def sumcheck_128(eval_tables, *, q, expression, challenges, num_rounds):
